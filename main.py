@@ -4,6 +4,7 @@ import pytesseract
 from PIL import Image
 from pdf2image import convert_from_bytes
 import io
+import fitz  # PyMuPDF
 
 app = FastAPI()
 
@@ -15,17 +16,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Função auxiliar para não repetir código
-def process_image_page(image):
+# --- Função OCR (Lenta, usada como Fallback) ---
+def process_image_with_ocr(image):
     custom_config = r'--oem 3 --psm 6 -l por'
     data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config=custom_config)
-    
-    page_words = []
-    n_boxes = len(data['text'])
-    
-    for i in range(n_boxes):
+    words = []
+    for i in range(len(data['text'])):
         if int(data['conf'][i]) > 0 and data['text'][i].strip() != "":
-            page_words.append({
+            words.append({
                 "text": data['text'][i],
                 "conf": data['conf'][i],
                 "box": {
@@ -33,46 +31,70 @@ def process_image_page(image):
                     "top": data['top'][i],
                     "width": data['width'][i],
                     "height": data['height'][i]
-                }
+                },
+                "method": "ocr" # Para você saber que foi OCR
             })
-    return page_words
+    return words
 
-@app.post("/ocr")
-async def read_file(file: UploadFile = File(...)):
-    # Lê o arquivo da memória
-    file_content = await file.read()
+# --- Função Nativa (Rápida, usada como Principal) ---
+def process_pdf_native(page):
+    words = []
+    # get_text("words") retorna lista de tuplas: (x0, y0, x1, y1, "palavra", block_no, line_no, word_no)
+    text_blocks = page.get_text("words")
     
+    for block in text_blocks:
+        x0, y0, x1, y1, text, block_no, line_no, word_no = block
+        words.append({
+            "text": text,
+            "conf": 100, # Confiança total pois é nativo
+            "box": {
+                "left": x0,
+                "top": y0,
+                "width": x1 - x0,
+                "height": y1 - y0
+            },
+            "method": "native" # Para você saber que foi extração direta
+        })
+    return words
+
+@app.post("/process")
+async def read_file(file: UploadFile = File(...)):
+    file_content = await file.read()
     results = []
 
-    # VERIFICAÇÃO: É PDF?
     if file.content_type == "application/pdf":
         try:
-            # Converte PDF para lista de imagens (uma por página)
-            # dpi=200 é um bom equilíbrio entre qualidade e velocidade
-            images = convert_from_bytes(file_content, dpi=200)
+            # Abre o PDF com PyMuPDF
+            doc = fitz.open(stream=file_content, filetype="pdf")
             
-            for index, img in enumerate(images):
-                words = process_image_page(img)
+            for i, page in enumerate(doc):
+                # 1. Tenta extração Nativa (Rápida)
+                page_words = process_pdf_native(page)
+                
+                # 2. Se a lista vier vazia, provavelmente é um PDF Escaneado (Imagem)
+                # Aí sim usamos o OCR (Lento)
+                if not page_words:
+                    print(f"Página {i+1} parece ser imagem. Usando OCR...")
+                    # Converte SÓ essa página para imagem
+                    images = convert_from_bytes(file_content, first_page=i+1, last_page=i+1, dpi=200)
+                    if images:
+                        page_words = process_image_with_ocr(images[0])
+                
                 results.append({
-                    "page": index + 1,
-                    "words": words
+                    "page": i + 1,
+                    "words": page_words
                 })
+                
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Erro ao processar PDF: {str(e)}")
+             raise HTTPException(status_code=500, detail=f"Erro PDF: {str(e)}")
 
-    # VERIFICAÇÃO: É Imagem? (JPG, PNG)
     elif file.content_type in ["image/jpeg", "image/png", "image/jpg"]:
-        try:
-            image = Image.open(io.BytesIO(file_content))
-            words = process_image_page(image)
-            results.append({
-                "page": 1,
-                "words": words
-            })
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Erro ao processar imagem: {str(e)}")
+        # Imagens diretas sempre precisam de OCR
+        image = Image.open(io.BytesIO(file_content))
+        words = process_image_with_ocr(image)
+        results.append({"page": 1, "words": words})
             
     else:
-        raise HTTPException(status_code=400, detail="Arquivo não suportado. Envie PDF, JPG ou PNG.")
+        raise HTTPException(status_code=400, detail="Formato inválido")
 
     return {"result": results}
