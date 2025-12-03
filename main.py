@@ -1,53 +1,78 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import pytesseract
 from PIL import Image
+from pdf2image import convert_from_bytes
 import io
 
 app = FastAPI()
 
-# Configuração de CORS (permite que seu Front na Vercel acesse esta API)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Em produção, troque "*" pela URL do seu site
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/")
-def home():
-    return {"status": "OCR Service Online"}
-
-@app.post("/ocr")
-async def read_image(file: UploadFile = File(...)):
-    # 1. Lê a imagem enviada
-    image_data = await file.read()
-    image = Image.open(io.BytesIO(image_data))
-
-    # 2. Configura para ler em Português
+# Função auxiliar para não repetir código
+def process_image_page(image):
     custom_config = r'--oem 3 --psm 6 -l por'
-    
-    # 3. Extrai dados (texto + coordenadas)
-    # image_to_data retorna um dicionário com listas de coordenadas
     data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT, config=custom_config)
-
-    words = []
+    
+    page_words = []
     n_boxes = len(data['text'])
     
-    # 4. Formata a resposta para JSON limpo
     for i in range(n_boxes):
-        # Filtra textos vazios ou confiança muito baixa (-1)
         if int(data['conf'][i]) > 0 and data['text'][i].strip() != "":
-            words.append({
+            page_words.append({
                 "text": data['text'][i],
-                "conf": data['conf'][i], # Confiança do OCR (0-100)
+                "conf": data['conf'][i],
                 "box": {
-                    "left": data['left'][i],   # Posição X
-                    "top": data['top'][i],     # Posição Y (importante para alinhar colunas)
-                    "width": data['width'][i], # Largura
-                    "height": data['height'][i]# Altura
+                    "left": data['left'][i],
+                    "top": data['top'][i],
+                    "width": data['width'][i],
+                    "height": data['height'][i]
                 }
             })
+    return page_words
 
-    return {"result": words}
+@app.post("/ocr")
+async def read_file(file: UploadFile = File(...)):
+    # Lê o arquivo da memória
+    file_content = await file.read()
+    
+    results = []
+
+    # VERIFICAÇÃO: É PDF?
+    if file.content_type == "application/pdf":
+        try:
+            # Converte PDF para lista de imagens (uma por página)
+            # dpi=200 é um bom equilíbrio entre qualidade e velocidade
+            images = convert_from_bytes(file_content, dpi=200)
+            
+            for index, img in enumerate(images):
+                words = process_image_page(img)
+                results.append({
+                    "page": index + 1,
+                    "words": words
+                })
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erro ao processar PDF: {str(e)}")
+
+    # VERIFICAÇÃO: É Imagem? (JPG, PNG)
+    elif file.content_type in ["image/jpeg", "image/png", "image/jpg"]:
+        try:
+            image = Image.open(io.BytesIO(file_content))
+            words = process_image_page(image)
+            results.append({
+                "page": 1,
+                "words": words
+            })
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erro ao processar imagem: {str(e)}")
+            
+    else:
+        raise HTTPException(status_code=400, detail="Arquivo não suportado. Envie PDF, JPG ou PNG.")
+
+    return {"result": results}
