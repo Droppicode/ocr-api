@@ -31,3 +31,27 @@ source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn main:app --reload
 ```
+
+## 📡 API Endpoints
+
+### `POST /extract`
+Extracts text from a provided PDF or image file.
+
+**Request:**
+- Content-Type: `multipart/form-data`
+- Body: `file` (The PDF or Image file)
+
+**cURL Example:**
+```bash
+curl -X POST "http://localhost:8000/extract" \
+  -H "accept: application/json" \
+  -H "Content-Type: multipart/form-data" \
+  -F "file=@/path/to/your/statement.pdf"
+```
+
+**Response (200 OK):**
+```json
+{
+  "text": "Extracted text content from the document..."
+}
+```
